@@ -200,6 +200,33 @@ const internalUnits = {
       // No-op, just needs to exist to satisfy dependency
     },
   },
+/*$ cat /usr/lib/systemd/system/lightdm.service 
+[Unit]
+Description=Light Display Manager
+Documentation=man:lightdm(1)
+After=systemd-user-sessions.service
+
+# replaces plymouth-quit since lightdm quits plymouth on its own
+Conflicts=plymouth-quit.service
+After=plymouth-quit.service
+
+# lightdm takes responsibility for stopping plymouth, so if it fails
+# for any reason, make sure plymouth still stops
+OnFailure=plymouth-quit.service
+
+[Service]
+ExecStart=/usr/sbin/lightdm
+Restart=always
+BusName=org.freedesktop.DisplayManager
+
+[Install]
+Alias=display-manager.service
+*/
+  'lightdm.service': {
+    dependencies: ['systemd-user-sessions.service', 'plymouth-quit.service'],
+    execStart: "/usr/sbin/lightdm",
+    restart: "always",
+  },
 };
 
 async function startUnit(name, chain=[]) {
@@ -217,7 +244,7 @@ async function startUnit(name, chain=[]) {
       return servicePromises[dep] ?? startUnit(dep, [name, ...chain]);
     }));
     log.i(`[${name}] starting due to ${chain}`);
-    if(internalUnits[name]){
+    if(unit.start && typeof unit.start === 'function'){
       await unit.start();
     } else {
       await spawnService(name, unit);

@@ -42,7 +42,7 @@ innit: loader.o $(JS_OBJ)
 	cc -static $^ -L./quickjs -lquickjs -lm -o innit
 
 diskimg: innit
-	bash disk-image-builder.sh
+	bash build-mmdebstrap-image.sh
 
 clean:
-	rm -f segments.h loader.o $(JS_OBJ) innit rootfs.ext4
+	rm -f segments.h loader.o $(JS_OBJ) innit disk.img

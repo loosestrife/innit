@@ -24,19 +24,27 @@ function makedev(major, minor) {
   return (major << 8) | minor;
 }
 
+const mountAndIgnoreEbusy = (src, target, type, flags, data) => {
+  try {
+    syscall.mount(src, target, type, flags, data);
+  } catch (e) {
+    if (e.errno !== 16) throw e;
+  }
+};
+
 exports.mountAll = () => {
   log.i("[mount] Mounting pseudo-filesystems...");
   try {
     // mount(source, target, fstype, flags, data)
     // Ensure mount points exist (mkdir -p logic would be good here in a full system)
-    syscall.mount("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
-    syscall.mount("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
+    mountAndIgnoreEbusy("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
+    mountAndIgnoreEbusy("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
     
     try {
-      syscall.mount("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755");
+      mountAndIgnoreEbusy("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755");
     } catch(e) {
       log.i("[mount] devtmpfs failed, falling back to tmpfs", e);
-      syscall.mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
+      mountAndIgnoreEbusy("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=0755");
       // Populate /dev with essential nodes if we are on tmpfs
       syscall.mknod("/dev/null", S_IFCHR | 0o666, makedev(1, 3));
       syscall.mknod("/dev/zero", S_IFCHR | 0o666, makedev(1, 5));
@@ -76,13 +84,27 @@ exports.mountAll = () => {
     try { syscall.symlink("/proc/self/fd/2", "/dev/stderr"); } catch(e) {}
 
     syscall.mkdirDashP("/dev/pts", 0o755);
-    syscall.mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
-    syscall.mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
-    syscall.mount("tmpfs", "/tmp", "tmpfs", 0, "");
+    mountAndIgnoreEbusy("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, "mode=0620,gid=5");
+    mountAndIgnoreEbusy("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755");
+    mountAndIgnoreEbusy("tmpfs", "/tmp", "tmpfs", 0, "");
   } catch (e) {
     log.i("[mount] Error mounting pseudo-fs:", e);
     throw e;
   }
+
+  const currentMounts = new Set();
+  try {
+    const mountsContent = fs.readFile("/proc/mounts");
+    if (mountsContent) {
+      const lines = mountsContent.split('\n');
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          currentMounts.add(parts[1]);
+        }
+      }
+    }
+  } catch (e) {}
 
   log.i("[mount] Processing /etc/fstab...");
   const fstab = fs.readFile("/etc/fstab");
@@ -105,6 +127,8 @@ exports.mountAll = () => {
             if(o === 'ro') flags |= MS_RDONLY;
             else if(o === 'rw') { /* default */ }
             else if(o === 'noatime') flags |= MS_NOATIME;
+            else if(o === 'relatime') flags |= MS_RELATIME;
+            else if(o === 'sync') flags |= MS_SYNCHRONOUS;
             else if(o === 'nosuid') flags |= MS_NOSUID;
             else if(o === 'nodev') flags |= MS_NODEV;
             else if(o === 'noexec') flags |= MS_NOEXEC;
@@ -116,11 +140,15 @@ exports.mountAll = () => {
           }
         }
 
+        if (currentMounts.has(mnt)) {
+          flags |= MS_REMOUNT;
+        }
+
         try {
           syscall.mount(dev, mnt, type, flags, data);
-          log.i(`[mount] Mounted ${mnt}`);
+          log.i(`[mount] ${flags & MS_REMOUNT ? "Remounted" : "Mounted"} ${mnt}`);
         } catch (e) {
-          log.i(`[mount] Failed to mount ${mnt}:`, e);
+          log.i(`[mount] Failed to ${flags & MS_REMOUNT ? "remount" : "mount"} ${mnt}:`, e);
         }
       }
     }
