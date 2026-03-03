@@ -5,6 +5,7 @@ const syscall = require("src/syscall.js");
 const fs = require("src/fs.js");
 const mount = require("src/mount.js");
 const network = require("src/network.js");
+const logger = require("src/logger.js");
 
 const LINUX_REBOOT_MAGIC1 = 0xfee1dead;
 const LINUX_REBOOT_MAGIC2 = 672274793;
@@ -82,15 +83,33 @@ function parseUnit(content) {
   };
 }
 
-function spawn(command) {
-  // Basic command splitting (does not handle quoted arguments)
+function spawn(command, options = {}) {
   const args = command.trim().split(/\s+/);
   const path = args[0];
+  const name = options.name || path;
+  
+  let stdio = options.stdio || [0, 1, 2];
+  let logWriteFd = -1;
+
+  if (options.useSyslog && name) {
+      logWriteFd = logger.openServiceLog(name);
+      if (logWriteFd >= 0) {
+          stdio = [0, logWriteFd, logWriteFd];
+      }
+  }
   
   const pid = syscall.fork();
   if (pid === 0) {
     // Child process
-    const env = [
+    if (stdio[0] !== 0) syscall.dup2(stdio[0], 0);
+    if (stdio[1] !== 1) syscall.dup2(stdio[1], 1);
+    if (stdio[2] !== 2) syscall.dup2(stdio[2], 2);
+
+    if (logWriteFd >= 0 && logWriteFd > 2) syscall.close(logWriteFd);
+
+    if (options.setsid) syscall.setsid();
+
+    const env = options.env || [
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "TERM=linux",
         "HOME=/root",
@@ -100,17 +119,28 @@ function spawn(command) {
     // If execve returns, it failed
     syscall.exit(127);
   }
-  if (pid > 0) {
-    pidToName.set(pid, path);
+
+  // Parent
+  if (logWriteFd >= 0) {
+      syscall.close(logWriteFd);
   }
-  return pid;
+
+  if (pid > 0) {
+    pidToName.set(pid, name);
+    const p = new Promise(resolve => {
+        pidResolvers.set(pid, resolve);
+    });
+    p.pid = pid;
+    return p;
+  }
+  return Promise.reject("fork failed");
 }
 
 async function spawnService(name, unit) {
   if (unit.execStart) {
-    const pid = spawn(unit.execStart);
+    const p = spawn(unit.execStart, { name, useSyslog: true, setsid: unit.setsid });
+    const pid = p.pid;
     pidToUnit.set(pid, name);
-    pidToName.set(pid, name);
     log.i(`[innit] Started ${name} (PID ${pid})`);
     // Simulate waiting for service readiness (e.g. waiting for sd_notify or PID file)
     await asyncSleep(100);
@@ -127,27 +157,71 @@ const internalUnits = {
     }
   },
   'network': {
-    dependencies: ['mounts'],
+    dependencies: ['udev'],
     start: async () => {
-      network.start();
+      await network.start();
     }
   },
   'hostname': {
-    dependencies: ['mounts', 'network'],
+    dependencies: ['network'],
     start: async () => {
       network.setHostname();
     }
   },
+  'syslog': {
+    dependencies: ['mounts'],
+    start: async () => {
+      logger.init();
+    }
+  },
+  'udev': {
+    dependencies: ['mounts', 'syslog'],
+    start: async () => {
+      // Try to load graphics driver manually if modprobe exists
+      const modprobePaths = ["/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "/usr/bin/modprobe"];
+      let modprobe = null;
+      for(const p of modprobePaths) {
+          const exists = await fs.access(p, 1);
+          log.i(`[innit] Checking modprobe at ${p}: ${exists}`);
+          if (exists) { modprobe = p; break; }
+      }
+      if (modprobe) {
+           log.i("[innit] Loading graphics modules...");
+           await spawn(`${modprobe} -a virtio-gpu virtio-pci drm_kms_helper drm`, { name: "modprobe", useSyslog: true });
+      } else {
+           log.i("[innit] modprobe not found, skipping module loading.");
+      }
+
+      const udevdPaths = ["/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd"];
+      let udevd = null;
+      for(const p of udevdPaths) {
+        const exists = await fs.access(p, 1);
+        log.i(`[innit] Checking udevd at ${p}: ${exists}`);
+        if (exists) { udevd = p; break; }
+      }
+      if (udevd) {
+        log.i("[innit] Starting udevd...");
+        spawn(udevd + " --daemon", { name: "udevd", useSyslog: true });
+        
+        // Trigger coldplug
+        log.i("[innit] Triggering udev events...");
+        await spawn("udevadm trigger --action=add", { name: "udevadm-trigger", useSyslog: true });
+        await spawn("udevadm settle", { name: "udevadm-settle", useSyslog: true });
+      } else {
+        log.i("[innit] udevd not found, skipping device setup.");
+      }
+    }
+  },
   'dbus': {
-    dependencies: ['mounts', 'network', 'hostname'],
+    dependencies: ['mounts', 'network', 'hostname', 'syslog'],
     start: async () => {
       syscall.mkdirDashP("/run/dbus", 0o755);
       syscall.mkdirDashP("/var/lib/dbus", 0o755);
       
       // Ensure machine-id exists (required for D-Bus)
-      await spawnAndPromiseEnd("/usr/bin/dbus-uuidgen --ensure");
+      await spawn("/usr/bin/dbus-uuidgen --ensure", { useSyslog: true });
 
-      const dbusParent = spawnAndPromiseEnd("/usr/bin/dbus-daemon --system --fork");
+      const dbusParent = spawn("/usr/bin/dbus-daemon --system --fork", { name: "dbus", useSyslog: true });
       await dbusParent; // Wait for parent to exit, signaling daemon is ready
       servicePromisesResolvers.dbus(true);
       log.i('[innit] dbus-daemon ready');
@@ -156,8 +230,7 @@ const internalUnits = {
   'network-manager': {
     dependencies: ['mounts', 'network', 'hostname', 'dbus'],
     start: async () => {
-      const nm = spawnAndPromiseEnd("/usr/sbin/NetworkManager");
-      servicePromisesResolvers['network-manager'](true);
+      const nm = spawn("/usr/sbin/NetworkManager", { name: "network-manager", useSyslog: true });
       // Don't await nm; we want it to run in the background
       nm.then(() => log.i('[innit] NetworkManager exited'));
     }
@@ -166,32 +239,57 @@ const internalUnits = {
     dependencies: ['mounts', 'network', 'hostname', 'dbus', 'network-manager'],
     start: async () => {
       // Try to start elogind if available (lightdm needs a seat manager)
-      const elogindPaths = ["/usr/libexec/elogind", "/usr/lib/elogind/elogind"];
+      const elogindPaths = ["/usr/libexec/elogind", "/usr/lib/elogind/elogind", "/lib/elogind/elogind"];
       let elogindPath = null;
       for(const path of elogindPaths){
-        try {
-          syscall.access(path, 1); // Check X_OK
-        } catch (e) {
-          continue;
+        if (await fs.access(path, 1)) {
+          elogindPath = path;
+          break;
         }
-        elogindPath = path;
-        break;
       }
       if(elogindPath){
       log.i("[innit] Found elogind, starting...");
         syscall.mkdirDashP("/run/systemd", 0o755);
-        spawn(elogindPath); // elogind daemonizes by default
+        spawn(elogindPath, { name: "elogind", useSyslog: true }); // elogind daemonizes by default
       }
       
-      // Ensure lightdm directories exist
+      // Create /var/run/utmp to silence elogind warning
       try {
-        syscall.mkdirDashP("/var/lib/lightdm", 0o755);
-        syscall.mkdirDashP("/var/lib/lightdm/data", 0o755);
-        syscall.mkdirDashP("/var/log/lightdm", 0o755);
-        syscall.mkdirDashP("/var/cache/lightdm", 0o755);
+          // O_WRONLY|O_CREAT|O_TRUNC = 1 | 64 | 512 = 577
+          const fd = syscall.open("/var/run/utmp", 577, 0o644);
+          if(fd >= 0) syscall.close(fd);
       } catch (e) {}
+      
+      // Ensure lightdm directories exist and have correct permissions
+      const lightdmDirs = [
+        "/var/lib/lightdm",
+        "/var/lib/lightdm/data",
+        "/var/log/lightdm",
+        "/var/cache/lightdm",
+        "/run/lightdm"
+      ];
+      
+      let uid = -1, gid = -1;
+      try {
+        const pw = fs.readFile("/etc/passwd");
+        if (pw) {
+            const match = pw.match(/^lightdm:[^:]+:(\d+):(\d+):/m);
+            if (match) {
+                uid = parseInt(match[1]);
+                gid = parseInt(match[2]);
+                log.i(`[innit] Found lightdm user: ${uid}:${gid}`);
+            }
+        }
+      } catch(e) {}
 
-      servicePromisesResolvers['systemd-user-sessions.service'](true);
+      for (const d of lightdmDirs) {
+        try {
+          syscall.mkdirDashP(d, 0o755);
+          if (uid !== -1) syscall.chown(d, uid, gid);
+        } catch (e) {
+            log.i(`[innit] Failed to setup ${d}:`, e);
+        }
+      }
     },
   },
   'plymouth-quit.service': {
@@ -226,23 +324,44 @@ Alias=display-manager.service
     dependencies: ['systemd-user-sessions.service', 'plymouth-quit.service'],
     execStart: "/usr/sbin/lightdm",
     restart: "always",
+    setsid: true,
   },
 };
+
+Object.assign(graph, internalUnits);
+
+{ // validate units
+  Object.keys(graph).forEach(name => {
+    const unit = graph[name];
+    unit.dependencies ?? (unit.dependencies = []);
+    if(!unit.start && !unit.execStart){
+      log.i('unit has no start or execStart', name);
+    }
+    const recognizedKeys = ['dependencies', 'start', 'execStart', 'restart', 'setsid'];
+    const unrecognizedKeys = Object.keys(unit).filter(k => !recognizedKeys.includes(k));
+    if(unrecognizedKeys.length){
+      log.i('unit has unrecognized keys', name, unrecognizedKeys);
+    }
+  });
+
+}
 
 async function startUnit(name, chain=[]) {
   if (name in servicePromises){
     return servicePromises[name];
   }
-  const unit = internalUnits[name] || graph[name];
+  const unit = graph[name];
   if (!unit) {
     log.i(`[innit] Unit ${name} not found ${chain}`);
     return Promise.reject(`Unit ${name} not found ${chain}`);
   }
   makeServicePromises(name, chain);
   const p = (async () => {
-    await Promise.all(unit.dependencies.map(dep => {
-      return servicePromises[dep] ?? startUnit(dep, [name, ...chain]);
-    }));
+    if(unit.dependencies){
+      await Promise.all(unit.dependencies.map(dep => {
+        return servicePromises[dep] ?? startUnit(dep, [name, ...chain]);
+      }));
+    }
     log.i(`[${name}] starting due to ${chain}`);
     if(unit.start && typeof unit.start === 'function'){
       await unit.start();
@@ -250,7 +369,9 @@ async function startUnit(name, chain=[]) {
       await spawnService(name, unit);
     }
     // Ensure the service is marked as ready so dependents can proceed
-    if (servicePromisesResolvers[name]) servicePromisesResolvers[name](true);
+    if (servicePromisesResolvers[name]){
+      servicePromisesResolvers[name](true);
+    }
   })();
   return p;
 }
@@ -269,7 +390,8 @@ async function runRescueShell() {
   globalThis.suspendSemaphore = new Promise(r => resolve = r);
 
   try {
-    const pid = spawn("/bin/sh");
+    const p = spawn("/bin/sh");
+    const pid = p.pid;
     const status = new Int32Array(1);
     syscall.wait4(pid, status, 0, 0); // Blocking wait
     
@@ -296,13 +418,6 @@ function PromiseAllServices(names) {
   return Promise.all(names.map(name => servicePromises[name]));
 }
 
-function spawnAndPromiseEnd(command) {
-  const pid = spawn(command);
-  return new Promise(resolve => {
-    pidResolvers.set(pid, resolve);
-  });
-}
-
 async function shutdown() {
   log.i("[innit] Powering off...");
   syscall.sync();
@@ -314,7 +429,7 @@ for (const dir of unitDirs) {
   for (const file of files) {
     if (file.endsWith(".service") || file.endsWith(".target")) {
       const content = fs.readFile(dir + "/" + file);
-      if (content) {
+      if (content && !graph[file]) {
         graph[file] = parseUnit(content);
       }
     }
@@ -343,7 +458,7 @@ else {
 
   PromiseAllServices(["mounts", "network", "hostname"]).then(async () => {
     log.i("[innit] Services ready. Spawning shell...");
-    await spawnAndPromiseEnd('/bin/bash');
+    await spawn('/bin/bash');
     log.i("[innit] Shell exited. Shutting down...");
     shutdown();
   });

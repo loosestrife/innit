@@ -1,3 +1,4 @@
+const logger = require("src/logger.js");
 const startTime = Date.now();
 
 Error.prototype.toString = function() {
@@ -25,7 +26,9 @@ globalThis.log = {
     const now = Date.now() - startTime;
     const secs = Math.floor(now / 1000);
     const msecs = String(now % 1000).padStart(3, '0');
-    console.log(`[${secs}.${msecs}]`, ...args);
+    const prefix = `[${secs}.${msecs}]`;
+    console.log(prefix, ...args);
+    logger.log(`${prefix} ${args.map(a => (a instanceof Error) ? a.toString() : String(a)).join(' ')}\n`);
   }
 };
 

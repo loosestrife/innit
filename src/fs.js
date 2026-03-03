@@ -80,3 +80,13 @@ exports.readFile = (path) => {
     throw e;
   }
 };
+
+exports.access = (path, mode = 0) => {
+  try {
+    syscall.access(path, mode);
+    return Promise.resolve(true);
+  } catch (e) {
+    if (e.errno === 2 || e.errno === 13) return Promise.resolve(false);
+    return Promise.reject(e);
+  }
+};

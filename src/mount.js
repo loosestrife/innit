@@ -40,6 +40,11 @@ exports.mountAll = () => {
     mountAndIgnoreEbusy("proc", "/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
     mountAndIgnoreEbusy("sysfs", "/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, "");
     
+
+    syscall.mkdirDashP("/sys/fs/cgroup", 0o755);
+    mountAndIgnoreEbusy("cgroup2", "/sys/fs/cgroup", "cgroup2", MS_NOSUID | MS_NOEXEC | MS_NODEV | MS_RELATIME, "nsdelegate");
+
+
     try {
       mountAndIgnoreEbusy("devtmpfs", "/dev", "devtmpfs", MS_NOSUID, "mode=0755");
     } catch(e) {
