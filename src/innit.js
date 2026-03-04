@@ -192,23 +192,30 @@ const internalUnits = {
            log.i("[innit] modprobe not found, skipping module loading.");
       }
 
-      const udevdPaths = ["/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd"];
+      const udevdPaths = ["/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd", "/sbin/udevd", "/usr/sbin/udevd"];
       let udevd = null;
       for(const p of udevdPaths) {
         const exists = await fs.access(p, 1);
         log.i(`[innit] Checking udevd at ${p}: ${exists}`);
         if (exists) { udevd = p; break; }
       }
-      if (udevd) {
+
+      const udevadmPaths = ["/bin/udevadm", "/usr/bin/udevadm", "/sbin/udevadm", "/usr/sbin/udevadm"];
+      let udevadm = null;
+      for(const p of udevadmPaths) {
+          if (await fs.access(p, 1)) { udevadm = p; break; }
+      }
+
+      if (udevd && udevadm) {
         log.i("[innit] Starting udevd...");
-        spawn(udevd + " --daemon", { name: "udevd", useSyslog: true });
+        await spawn(udevd + " --daemon", { name: "udevd", useSyslog: true });
         
         // Trigger coldplug
         log.i("[innit] Triggering udev events...");
-        await spawn("udevadm trigger --action=add", { name: "udevadm-trigger", useSyslog: true });
-        await spawn("udevadm settle", { name: "udevadm-settle", useSyslog: true });
+        await spawn(udevadm + " trigger --action=add", { name: "udevadm-trigger", useSyslog: true });
+        await spawn(udevadm + " settle", { name: "udevadm-settle", useSyslog: true });
       } else {
-        log.i("[innit] udevd not found, skipping device setup.");
+        log.i(`[innit] udevd/udevadm not found (d=${udevd}, adm=${udevadm}), skipping device setup.`);
       }
     }
   },
@@ -479,14 +486,40 @@ else {
         }
       }
 
-      // WNOHANG = 1. Check for exited children without blocking.
-      const { pid, status } = syscall.waitpid(-1, 1);
-      
-      if (pid > 0) {
+      // Reap all zombies
+      while (true) {
+        // Peek for zombies without reaping (WNOWAIT = 0x01000000)
+        // P_ALL = 0, WEXITED = 4, WNOHANG = 1
+        const peek = syscall.waitid(0, 0, 4 | 1 | 0x01000000);
+        
+        if (peek.success && peek.pid > 0) {
+            const ppid = peek.pid;
+            if (!pidToName.has(ppid)) {
+                // Identify orphan
+                try {
+                    let name = fs.readFile(`/proc/${ppid}/cmdline`);
+                    if (name) {
+                        // cmdline is null-separated
+                        name = name.replace(/\0/g, ' ').trim();
+                    }
+                    if (!name) {
+                        name = fs.readFile(`/proc/${ppid}/comm`);
+                        if (name) name = name.trim();
+                    }
+                    if (name) {
+                        pidToName.set(ppid, `orphan: ${name}`);
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // WNOHANG = 1. Check for exited children without blocking.
+        const { pid, status } = syscall.waitpid(-1, 1);
+        if (pid <= 0) break;
+
         const procName = pidToName.get(pid) || "unknown";
         log.i(`[innit] Reaped PID ${pid} (status ${status}) name: ${procName}`);
         pidToName.delete(pid);
-
         if (pidResolvers.has(pid)) {
           pidResolvers.get(pid)(status);
           pidResolvers.delete(pid);
@@ -512,10 +545,8 @@ else {
               }
           }
         }
-      } else {
-        // No state changes, sleep briefly to avoid busy loop
-        await asyncSleep(500);
       }
+      await asyncSleep(500);
     } catch (e) {
       // Ignore ECHILD (10) which happens when there are no children to wait for
       if (e.errno !== 10) {

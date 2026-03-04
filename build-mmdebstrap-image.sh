@@ -2,7 +2,7 @@ set -ex
 
 mmdebstrap \
   --variant=important \
-  --include=linux-image-amd64,grub-pc,lightdm,cinnamon-desktop-environment,firefox-esr,binutils,xterm,network-manager-gnome,sudo,elogind,libpam-elogind,dbus-x11,pciutils,sysvinit-core,sysv-rc \
+  --include=linux-image-amd64,grub-pc,lightdm,cinnamon-desktop-environment,firefox-esr,binutils,xterm,network-manager-gnome,sudo,elogind,libpam-elogind,dbus-x11,pciutils,sysvinit-core,sysv-rc,udev \
   --customize-hook='chroot "$1" useradd -m -G sudo,netdev -s /bin/bash minty' \
   --customize-hook='chroot "$1" sh -c "echo minty:password | chpasswd"' \
   --customize-hook='chroot "$1" sh -c "mkdir -p /etc/lightdm/lightdm.conf.d && printf \"[Seat:*]\nautologin-user=minty\nautologin-user-timeout=0\n\" > /etc/lightdm/lightdm.conf.d/autologin.conf"' \

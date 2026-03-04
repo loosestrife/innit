@@ -29,3 +29,16 @@ module.exports.mkdirDashP = (path, mode) => {
     return 0;
   }
 };
+
+module.exports.waitid = (idtype, id, options) => {
+  const siginfo = new Uint8Array(128);
+  // syscall(SYS_waitid, which, upid, infop, options, rusage)
+  const ret = globalThis.syscall("waitid", nums.waitid, idtype, id, siginfo, options, 0);
+  if (ret === 0) {
+     const view = new DataView(siginfo.buffer);
+     // si_pid is at offset 16 on x86_64
+     const pid = view.getInt32(16, true);
+     return { success: true, pid };
+  }
+  return { success: false, pid: 0 };
+};
